@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Solo_5to_cohorte — motor SATE-SR v3.0 (copia autocontenida)
+Solo_5to_cohorte — motor SATE-SR v3.1+ (copia autocontenida)
 ===========================================================
 Paquete independiente: NO importa `proyecto_sate_curso.py` del proyecto principal.
 
@@ -45,12 +45,21 @@ logger = logging.getLogger(__name__)
 # Importaciones opcionales - si scikit-learn no está disponible, usar implementación manual
 try:
     from sklearn.metrics import (
-        precision_score, recall_score, f1_score, 
-        roc_auc_score, confusion_matrix
+        precision_score, recall_score, f1_score,
+        roc_auc_score, confusion_matrix,
     )
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
     HAS_SKLEARN = True
+    HAS_SKLEARN_CLASSIFIERS = True
 except ImportError:
     HAS_SKLEARN = False
+    HAS_SKLEARN_CLASSIFIERS = False
+    LogisticRegression = None  # type: ignore[misc, assignment]
+    train_test_split = None  # type: ignore[misc, assignment]
+    StandardScaler = None  # type: ignore[misc, assignment]
     print("[INFO] scikit-learn no disponible, usando implementacion manual de metricas")
 
 try:
@@ -80,7 +89,7 @@ except ImportError:
     print("[INFO] Para mejor precisión, instala: py -m pip install pysentimiento torch transformers")
 
 MODEL_CONFIG = {
-    "version": "3.1.0",
+    "version": "3.1.1",
     "conversion_notas": {
         'C': 5,   # En Inicio
         'B': 13,  # En Proceso
@@ -786,6 +795,121 @@ def cargar_resumen_notas_historial(
     return out
 
 
+def aplicar_regresion_logistica_motor(df_final: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Regresión logística complementaria: B1, B2 y factores SATE → aprueba según nota B3 observada.
+
+    Entrena con filas que tienen las seis features; el objetivo es clasificar_resultado(NotaBim3).
+    Añade Proba_Logistica_Aprueba y Prediccion_Logistica_Binaria (refit en todo el set etiquetado).
+    Métricas holdout (20 %) solo informativas. Si no hay sklearn o datos mínimos, retorna activo=False.
+    """
+    vacio: Dict[str, Any] = {"activo": False, "motivo": "sklearn no disponible"}
+    if not HAS_SKLEARN_CLASSIFIERS:
+        for est in df_final:
+            est["Proba_Logistica_Aprueba"] = None
+            est["Prediccion_Logistica_Binaria"] = None
+        return vacio
+
+    def _fila_x(est: Dict[str, Any]) -> Optional[List[float]]:
+        try:
+            return [
+                float(est.get("NotaBim1", 5) or 5),
+                float(est.get("NotaBim2", 5) or 5),
+                float(est.get("Analisis_Asistencia", 1)),
+                float(est.get("Analisis_Incidencias", 1)),
+                float(est.get("Analisis_Sentimiento_Estudiante", 1)),
+                float(est.get("Analisis_Situacion_Familiar", 1)),
+            ]
+        except (TypeError, ValueError):
+            return None
+
+    X_rows: List[List[float]] = []
+    y_rows: List[int] = []
+    for est in df_final:
+        xv = _fila_x(est)
+        if xv is None:
+            continue
+        nb3 = est.get("NotaBim3", 5)
+        if nb3 is None:
+            continue
+        yb = clasificar_resultado(float(nb3))
+        X_rows.append(xv)
+        y_rows.append(yb)
+
+    for est in df_final:
+        est.setdefault("Proba_Logistica_Aprueba", None)
+        est.setdefault("Prediccion_Logistica_Binaria", None)
+
+    if len(X_rows) < 12 or len(set(y_rows)) < 2:
+        motivo = "muestra insuficiente o una sola clase en B3"
+        logger.info("Regresión logística motor: %s (n=%s)", motivo, len(X_rows))
+        return {"activo": False, "motivo": motivo, "n_etiquetados": len(X_rows)}
+
+    if LogisticRegression is None or train_test_split is None or StandardScaler is None:
+        for est in df_final:
+            est["Proba_Logistica_Aprueba"] = None
+            est["Prediccion_Logistica_Binaria"] = None
+        return {"activo": False, "motivo": "sklearn classifiers no cargados"}
+
+    X_arr = X_rows
+    y_arr = y_rows
+
+    acc_holdout: Optional[float] = None
+    auc_holdout: Optional[float] = None
+    if len(X_arr) >= 30:
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_arr, y_arr, test_size=0.2, random_state=42, stratify=y_arr
+            )
+            scaler_h = StandardScaler()
+            X_train_s = scaler_h.fit_transform(X_train)
+            X_test_s = scaler_h.transform(X_test)
+            lr_h = LogisticRegression(max_iter=1200, random_state=42)
+            lr_h.fit(X_train_s, y_train)
+            y_hat = lr_h.predict(X_test_s)
+            acc_holdout = float(sum(int(a == b) for a, b in zip(y_test, y_hat)) / len(y_test)) if y_test else None
+            if len(set(y_test)) >= 2 and HAS_SKLEARN:
+                try:
+                    proba_t = lr_h.predict_proba(X_test_s)[:, 1]
+                    auc_holdout = float(roc_auc_score(y_test, proba_t))
+                except Exception:
+                    auc_holdout = None
+        except ValueError as e:
+            logger.info("Regresión logística motor: holdout omitido (%s)", e)
+
+    scaler_f = StandardScaler()
+    X_full_s = scaler_f.fit_transform(X_arr)
+    lr_full = LogisticRegression(max_iter=1200, random_state=42)
+    lr_full.fit(X_full_s, y_arr)
+
+    for est in df_final:
+        xv = _fila_x(est)
+        if xv is None:
+            continue
+        xs = scaler_f.transform([xv])
+        proba = float(lr_full.predict_proba(xs)[0, 1])
+        pred = int(proba >= 0.5)
+        est["Proba_Logistica_Aprueba"] = round(proba, 4)
+        est["Prediccion_Logistica_Binaria"] = pred
+
+    msg_h = ""
+    if acc_holdout is not None:
+        msg_h = f"accuracy holdout 20%={acc_holdout:.4f}"
+        if auc_holdout is not None:
+            msg_h += f"; AUC holdout={auc_holdout:.4f}"
+    else:
+        msg_h = "holdout omitido (n<30 o stratify no aplicable); modelo fit en cohorte completa"
+    print(f"[INFO] Regresión logística (motor): n={len(X_rows)} filas etiquetadas; {msg_h}")
+
+    return {
+        "activo": True,
+        "n_etiquetados": len(X_rows),
+        "accuracy_holdout": acc_holdout,
+        "auc_holdout": auc_holdout,
+        "descripcion": "Features: B1,B2 + 4 factores SATE; target: aprueba según nota B3 (umbral motor)",
+    }
+
+
 def ejecutar_analisis_sate(
     mongodb_uri: str,
     database_name: str,
@@ -922,7 +1046,6 @@ def ejecutar_analisis_sate(
                     continue
                 
                 nota_numerica = convertir_calificacion(doc.get('PROMEDIO_APRENDIZAJE_AUTONOMO'))
-                
                 resultados.append({
                     'DNI': dni,
                     'Apellidos_Nombres': nombres,
@@ -1170,39 +1293,29 @@ def ejecutar_analisis_sate(
         # ============================================
         print('[INFO] Validando modelo con validación temporal...')
         print('[INFO] Usando Bim1 y Bim2 para predecir Bim3, y validando con Bim3 real')
-        
-        # Validación temporal: usar Bim1 y Bim2 para predecir Bim3
-        # Esto es más realista porque simula predecir el futuro
-        y_true_temporal = []
-        y_pred_temporal = []
-        y_scores_temporal = []  # Scores continuos para calcular AUC-ROC con mayor precisión
-        
+
+        y_true_temporal: List[int] = []
+        y_pred_temporal: List[int] = []
+        y_scores_temporal: List[float] = []
+
         for est in df_final:
-            # Solo validar estudiantes que tienen al menos Bim1 y Bim2
             if est.get('NotaBim1') and est.get('NotaBim2') and est.get('NotaBim3'):
-                # Realidad: clasificar Bim3 real
                 realidad_bim3 = clasificar_resultado(est['NotaBim3'])
-                
-                # Predicción: usar solo Bim1 y Bim2 para predecir Bim3
-                # Simular proyección usando solo los primeros dos bimestres
+
                 notas_para_validacion = [est.get('NotaBim1', 5), est.get('NotaBim2', 5)]
                 nota_min, nota_max = MODEL_CONFIG["nota_escala"]
                 notas_validadas = [max(nota_min, min(nota_max, n)) for n in notas_para_validacion]
-                
-                # Regresión lineal simple con solo 2 puntos
+
                 if len(notas_validadas) == 2:
-                    # Proyección simple: continuar la tendencia
                     cambio = notas_validadas[1] - notas_validadas[0]
                     proyeccion_bim3 = notas_validadas[1] + cambio
-                    
-                    # Aplicar límite de cambio máximo
+
                     max_cambio = MODEL_CONFIG["max_proyeccion_cambio"]
                     proyeccion_bim3 = max(
                         notas_validadas[1] - max_cambio,
-                        min(notas_validadas[1] + max_cambio, proyeccion_bim3)
+                        min(notas_validadas[1] + max_cambio, proyeccion_bim3),
                     )
-                    
-                    # Aplicar penalización por factores de riesgo (igual que en el modelo real)
+
                     pesos = MODEL_CONFIG["pesos_penalizacion"]
                     castigo = (
                         (1 - est.get('Analisis_Asistencia', 1)) * pesos["asistencia"] +
@@ -1210,39 +1323,48 @@ def ejecutar_analisis_sate(
                         (1 - est.get('Analisis_Sentimiento_Estudiante', 1)) * pesos["sentimiento"] +
                         (1 - est.get('Analisis_Situacion_Familiar', 1)) * pesos["familia"]
                     )
-                    
-                    nota_final_validacion = max(nota_min, min(nota_max, proyeccion_bim3 - castigo))
+
+                    nota_final_validacion = max(
+                        nota_min, min(nota_max, proyeccion_bim3 - castigo)
+                    )
                     prediccion_bim3 = clasificar_resultado(nota_final_validacion)
-                    
+
                     y_true_temporal.append(realidad_bim3)
                     y_pred_temporal.append(prediccion_bim3)
-                    y_scores_temporal.append(nota_final_validacion)  # Guardar score continuo para AUC-ROC
-        
-        # Calcular métricas con validación temporal usando scores continuos (MEJORA SIGNIFICATIVA)
+                    y_scores_temporal.append(nota_final_validacion)
+
         if len(y_true_temporal) > 0:
             print(f'[INFO] Validación temporal: {len(y_true_temporal)} estudiantes con datos completos')
-            print(f'[INFO] Calculando AUC-ROC con scores continuos (notas proyectadas) para mayor precisión...')
+            print('[INFO] Calculando AUC-ROC con scores continuos (notas proyectadas)...')
             metricas = calcular_metricas(y_true_temporal, y_pred_temporal, y_scores_temporal)
-            
-            # Log de métricas temporales para debugging
-            logger.info(f'VALIDACION TEMPORAL - AUC-ROC: {metricas["auc_roc"]:.4f} (usando scores continuos)')
-            logger.info(f'VALIDACION TEMPORAL - Precision: {metricas["precision"]:.4f}, Recall: {metricas["recall"]:.4f}')
-            print(f'[OK] AUC-ROC mejorado usando scores continuos: {metricas["auc_roc"]:.4f}')
+            logger.info(
+                'VALIDACION TEMPORAL - AUC-ROC: %.4f (scores continuos)',
+                metricas['auc_roc'],
+            )
+            logger.info(
+                'VALIDACION TEMPORAL - Precision: %.4f, Recall: %.4f',
+                metricas['precision'],
+                metricas['recall'],
+            )
+            print(f'[OK] AUC-ROC validación temporal: {metricas["auc_roc"]:.4f}')
         else:
             print('[ADVERTENCIA] No hay suficientes datos para validación temporal, usando validación estándar')
-            # Fallback: validación estándar usando notas proyectadas como scores
-            y_true = []
-            y_pred = []
-            y_scores = []
+            y_true: List[int] = []
+            y_pred: List[int] = []
+            y_scores: List[float] = []
             for est in df_final:
                 realidad_bim3 = clasificar_resultado(est.get('NotaBim3', 5))
                 y_true.append(realidad_bim3)
                 y_pred.append(est['Prediccion_Final_Binaria'])
-                y_scores.append(est['Nota_Proyectada_B4'])  # Usar nota proyectada como score
-            
-            print('[INFO] Calculando AUC-ROC con scores continuos (notas proyectadas) para mayor precisión...')
+                y_scores.append(est['Nota_Proyectada_B4'])
+            print('[INFO] Calculando AUC-ROC con scores continuos (notas proyectadas B4)...')
             metricas = calcular_metricas(y_true, y_pred, y_scores)
-            logger.info(f'VALIDACION ESTANDAR - AUC-ROC: {metricas["auc_roc"]:.4f} (usando scores continuos)')
+            logger.info(
+                'VALIDACION ESTANDAR - AUC-ROC: %.4f (scores continuos)',
+                metricas['auc_roc'],
+            )
+        
+        log_motor = aplicar_regresion_logistica_motor(df_final)
         
         # ============================================
         # PREPARAR RESULTADOS FINALES
@@ -1296,7 +1418,8 @@ def ejecutar_analisis_sate(
                 'promedio_nota_proyectada': promedio_nota_proyectada,
                 'historial_dnis_utiles': n_hist_ok,
                 'historial_pct_cobertura': round(pct_hist, 2),
-                **metricas
+                **metricas,
+                'regresion_logistica': log_motor,
             },
             'factores_riesgo': factores_riesgo,
             'resultados': [
@@ -1320,6 +1443,8 @@ def ejecutar_analisis_sate(
                     'Nota_Nucleo_B4': round(float(est['Nota_Nucleo_B4']), 2),
                     'Nota_Proyectada_B4': round(est['Nota_Proyectada_B4'], 2),
                     'Prediccion_Final_Binaria': est['Prediccion_Final_Binaria'],
+                    'Proba_Logistica_Aprueba': est.get('Proba_Logistica_Aprueba'),
+                    'Prediccion_Logistica_Binaria': est.get('Prediccion_Logistica_Binaria'),
                     'Estado': est['Estado']
                 }
                 for est in df_final
@@ -1397,6 +1522,8 @@ def resultado_a_dataframe_ml(resultado: dict[str, Any]) -> pd.DataFrame:
                 "nota_nucleo_b4": r.get("Nota_Nucleo_B4"),
                 "nota_proyectada_b4": r.get("Nota_Proyectada_B4"),
                 "target_aprueba_binario": r.get("Prediccion_Final_Binaria"),
+                "proba_logistica_aprueba": r.get("Proba_Logistica_Aprueba"),
+                "prediccion_logistica_binaria": r.get("Prediccion_Logistica_Binaria"),
             }
         )
 
@@ -1460,7 +1587,7 @@ def _kpis_y_resumen_factores_planos(resultado: dict[str, Any]) -> dict[str, Any]
     s_sr, s_cr = fr_pair("sentimiento")
     f_sr, f_cr = fr_pair("situacion_familiar")
 
-    return {
+    base: dict[str, Any] = {
         "ejecucion_fecha": resultado.get("fecha_analisis"),
         "ejecucion_anio_lectivo": resultado.get("anio_lectivo"),
         "ejecucion_database": resultado.get("database_name"),
@@ -1488,6 +1615,13 @@ def _kpis_y_resumen_factores_planos(resultado: dict[str, Any]) -> dict[str, Any]
         "resumen_factor_familia_sin_riesgo_n": f_sr,
         "resumen_factor_familia_con_riesgo_n": f_cr,
     }
+    rl = m.get("regresion_logistica")
+    if isinstance(rl, dict):
+        base["regresion_logistica_activo"] = bool(rl.get("activo"))
+        base["regresion_logistica_n"] = rl.get("n_etiquetados")
+        base["regresion_logistica_acc_holdout"] = rl.get("accuracy_holdout")
+        base["regresion_logistica_auc_holdout"] = rl.get("auc_holdout")
+    return base
 
 
 def resultado_a_dataframe_dashboard_completo(resultado: dict[str, Any]) -> pd.DataFrame:
@@ -1533,6 +1667,8 @@ def resultado_a_dataframe_dashboard_completo(resultado: dict[str, Any]) -> pd.Da
             "Hist años muestra": r.get("Hist_Anios_Muestra"),
             "Nota Proy. B4": r.get("Nota_Proyectada_B4"),
             "Estado": estado,
+            "Proba logística aprob.": r.get("Proba_Logistica_Aprueba"),
+            "Pred. logística (0/1)": r.get("Prediccion_Logistica_Binaria"),
         }
         row.update(extras)
         records.append(row)
@@ -1662,6 +1798,45 @@ def generar_graficos(resultado: dict[str, Any], directorio: Path) -> list[Path]:
         fig.savefig(p5, dpi=150)
         plt.close(fig)
         guardados.append(p5)
+
+    # 6) Barras: precisión, recall, F1, AUC-ROC (validación temporal del motor)
+    m_val = resultado.get("metricas") or {}
+    metricas_barras: list[tuple[str, float]] = []
+    for etiqueta, clave in (
+        ("Precisión", "precision"),
+        ("Recall", "recall"),
+        ("F1", "f1_score"),
+        ("AUC-ROC", "auc_roc"),
+    ):
+        v = m_val.get(clave)
+        if v is not None:
+            try:
+                metricas_barras.append((etiqueta, float(v)))
+            except (TypeError, ValueError):
+                pass
+    if metricas_barras:
+        nombres = [t[0] for t in metricas_barras]
+        valores = [t[1] for t in metricas_barras]
+        colores = ["#3498db", "#2ecc71", "#9b59b6", "#e67e22"][: len(nombres)]
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        bars = ax.bar(nombres, valores, color=colores)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Valor")
+        ax.set_title("Métricas de validación temporal (B1+B2 → B3)")
+        ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+        for bar, val in zip(bars, valores):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                val + 0.02,
+                f"{val:.4f}",
+                ha="center",
+                fontsize=10,
+            )
+        fig.tight_layout()
+        p6 = directorio / "06_metricas_validacion.png"
+        fig.savefig(p6, dpi=150)
+        plt.close(fig)
+        guardados.append(p6)
 
     return guardados
 
@@ -2441,6 +2616,21 @@ def main() -> None:
         if k in m:
             label = "F1" if k == "f1_score" else k.upper()
             print(f"{label:<12} {m[k]:.4f}")
+
+    rl = m.get("regresion_logistica")
+    if isinstance(rl, dict) and rl.get("activo"):
+        ah, au = rl.get("accuracy_holdout"), rl.get("auc_holdout")
+        extra = ""
+        if ah is not None:
+            extra += f"  acc_holdout={ah:.4f}"
+        if au is not None:
+            extra += f"  auc_holdout={au:.4f}"
+        print(
+            "\n--- Regresión logística (complementaria; target=aprueba según B3) ---\n"
+            f"  n etiquetados: {rl.get('n_etiquetados')}{extra}"
+        )
+    elif isinstance(rl, dict) and not rl.get("activo"):
+        print(f"\n--- Regresión logística: omitida ({rl.get('motivo', 'n/a')}) ---")
 
     mc = m.get("matriz_confusion")
     if isinstance(mc, dict):
