@@ -22,12 +22,15 @@ from datetime import datetime
 import re
 import math
 import logging
-# Configurar codificación UTF-8 para Windows
+# Configurar codificación UTF-8 para Windows (omitir en Jupyter/IPython: OutStream no tiene .buffer)
 import sys
 import io
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    _so = sys.stdout
+    _se = sys.stderr
+    if getattr(_so, "buffer", None) is not None and getattr(_se, "buffer", None) is not None:
+        sys.stdout = io.TextIOWrapper(_so.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(_se.buffer, encoding='utf-8', errors='replace')
 
 # Configurar logging para que Flask muestre los mensajes
 logging.basicConfig(
